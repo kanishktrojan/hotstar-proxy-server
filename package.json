@@ -1,0 +1,19 @@
+{
+  "name": "hotstar-restream-proxy",
+  "version": "2.0.0",
+  "description": "Multi-stream HLS proxy with caching, rate limiting, and web UI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.4",
+    "express": "^4.21.0",
+    "node-fetch": "^2.7.0",
+    "uuid": "^9.0.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
