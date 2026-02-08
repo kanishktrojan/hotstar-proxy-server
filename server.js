@@ -54,8 +54,8 @@ const rateLimiter = new RateLimiter(60); // Max 60 req/sec to CDN per worker
 
 // Cache TTLs
 const CACHE_TTL = {
-  MASTER_PLAYLIST: 2000,   // 2s
-  CHILD_PLAYLIST:  800,    // 800ms — fast segment discovery
+  MASTER_PLAYLIST: 4000,   // 4s — master playlists rarely change
+  CHILD_PLAYLIST:  2000,   // 2s — still catches new segments quickly (HLS target duration is ~6s)
   SEGMENT:         600000, // 10m — .ts segments are immutable
 };
 
@@ -322,10 +322,11 @@ app.get('/stream/:slug/playlist', async (req, res) => {
         `/stream/${slug}/segment?path=$1`
       );
 
-    // ── Prefetch: warm cache for segments listed in this playlist ──
+    // ── Prefetch: warm cache for upcoming segments ──
     const segMatches = playlist.match(/^(?!#)([^\s]+\.ts[^\s]*)$/gm);
     if (segMatches && segMatches.length > 0) {
-      const toWarm = segMatches.slice(-3);
+      // Warm last 5 segments with low priority — won't steal tokens from real requests
+      const toWarm = segMatches.slice(-5);
       for (const seg of toWarm) {
         let segUrl;
         if (seg.startsWith('http')) {
@@ -341,8 +342,9 @@ app.get('/stream/:slug/playlist', async (req, res) => {
         if (!cache.has(segKey) && !dedup.inflight.has(segKey)) {
           dedup.dedupFetch(segKey, async () => {
             try {
-              await rateLimiter.acquire('normal');
-              const resp = await fetchWithTimeout(segUrl, { headers: getHeaders(stream.hdntl) }, 8000);
+              // 'low' priority — skipped entirely when rate limiter is under backoff pressure
+              await rateLimiter.acquire('low');
+              const resp = await fetchWithTimeout(segUrl, { headers: getHeaders(stream.hdntl) }, 10000);
               if (resp.ok) {
                 const buf = await resp.buffer();
                 cache.set(segKey, buf, { 'content-length': resp.headers.get('content-length') }, CACHE_TTL.SEGMENT);
@@ -365,7 +367,7 @@ app.get('/stream/:slug/playlist', async (req, res) => {
   }
 });
 
-// ── TS Segments (unified route) ──
+// ── TS Segments (unified route — streams directly to client) ──
 app.get('/stream/:slug/segment', async (req, res) => {
   const { slug } = req.params;
 
@@ -377,7 +379,6 @@ app.get('/stream/:slug/segment', async (req, res) => {
     let url;
     let segName;
     if (req.query.url) {
-      // Full absolute URL
       url = decodeURIComponent(req.query.url);
       segName = url.split('/').pop().split('?')[0];
     } else if (req.query.path) {
@@ -395,7 +396,7 @@ app.get('/stream/:slug/segment', async (req, res) => {
 
     const cacheKey = `${slug}:seg:${segName}`;
 
-    // Check cache first
+    // 1. Cache hit — send immediately
     const cached = cache.get(cacheKey);
     if (cached) {
       res.set('Content-Type', 'video/mp2t');
@@ -407,42 +408,74 @@ app.get('/stream/:slug/segment', async (req, res) => {
       return res.send(cached.data);
     }
 
-    // Dedup + rate limit
-    const result = await dedup.dedupFetch(cacheKey, async () => {
-      await rateLimiter.acquire();
-
-      const response = await fetchWithTimeout(url, { headers: getHeaders(stream.hdntl) }, 12000);
-
-      if (!response.ok) {
-        rateLimiter.onCdnError(response.status);
-        if (response.status === 403) {
-          console.error(`[${slug}][TS] CDN 403 for ${segName} — token likely expired`);
-          throw new Error(`CDN 403 Forbidden — hdntl token expired or invalid`);
-        }
-        throw new Error(`Segment CDN ${response.status}`);
+    // 2. Another request is already fetching this segment — wait for its buffer
+    if (dedup.inflight.has(cacheKey)) {
+      const result = await dedup.inflight.get(cacheKey);
+      res.set('Content-Type', 'video/mp2t');
+      res.set('Cache-Control', 'max-age=300');
+      res.set('X-Cache', 'DEDUP');
+      if (result.headers['content-length']) {
+        res.set('Content-Length', result.headers['content-length']);
       }
+      return res.send(result.buffer);
+    }
 
-      rateLimiter.onCdnSuccess();
-      const buffer = await response.buffer();
-      const headers = {
-        'content-length': response.headers.get('content-length'),
-      };
+    // 3. First request — stream directly from CDN to client (no full-buffer wait)
+    await rateLimiter.acquire();
 
-      cache.set(cacheKey, buffer, headers, CACHE_TTL.SEGMENT);
-      return { buffer, headers };
-    });
+    const response = await fetchWithTimeout(url, { headers: getHeaders(stream.hdntl) }, 15000);
 
+    if (!response.ok) {
+      rateLimiter.onCdnError(response.status);
+      if (response.status === 403) {
+        console.error(`[${slug}][TS] CDN 403 for ${segName} — token likely expired`);
+        throw new Error(`CDN 403 Forbidden — hdntl token expired or invalid`);
+      }
+      throw new Error(`Segment CDN ${response.status}`);
+    }
+
+    rateLimiter.onCdnSuccess();
+
+    // Send headers immediately so the player can start processing chunks
+    const cl = response.headers.get('content-length');
     res.set('Content-Type', 'video/mp2t');
     res.set('Cache-Control', 'max-age=300');
     res.set('X-Cache', 'MISS');
-    if (result.headers['content-length']) {
-      res.set('Content-Length', result.headers['content-length']);
-    }
-    res.send(result.buffer);
+    if (cl) res.set('Content-Length', cl);
+
+    // Stream chunks to client while collecting buffer for cache + dedup waiters
+    const chunks = [];
+    const bufferPromise = new Promise((resolve, reject) => {
+      response.body.on('data', chunk => {
+        chunks.push(chunk);
+        if (!res.destroyed) res.write(chunk);
+      });
+      response.body.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        const headers = { 'content-length': cl || String(buffer.length) };
+        cache.set(cacheKey, buffer, headers, CACHE_TTL.SEGMENT);
+        if (!res.destroyed) res.end();
+        resolve({ buffer, headers });
+      });
+      response.body.on('error', err => {
+        if (!res.destroyed) res.end();
+        reject(err);
+      });
+    });
+
+    // Register for dedup so concurrent requests for the same segment wait for this buffer
+    dedup.inflight.set(cacheKey, bufferPromise);
+    bufferPromise.finally(() => dedup.inflight.delete(cacheKey));
+
+    await bufferPromise;
 
   } catch (err) {
     console.error(`[${slug}][TS] ${err.message}`);
-    res.status(502).send('Segment error');
+    if (!res.headersSent) {
+      res.status(502).send('Segment error');
+    } else if (!res.destroyed) {
+      res.end();
+    }
   }
 });
 
