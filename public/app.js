@@ -93,13 +93,21 @@ function getFullProxyUrl(proxyPath) {
 }
 
 function renderBadge(stream) {
+  let badges = '';
+
+  // Token badge
   if (stream.tokenValid === true) {
-    return `<span class="badge badge-valid">${stream.remainingMinutes}m left</span>`;
+    badges += `<span class="badge badge-valid">${stream.remainingMinutes}m left</span>`;
+  } else if (stream.tokenValid === false) {
+    badges += `<span class="badge badge-expired">EXPIRED</span>`;
+  } else {
+    badges += `<span class="badge badge-unknown">Unknown Expiry</span>`;
   }
-  if (stream.tokenValid === false) {
-    return `<span class="badge badge-expired">EXPIRED</span>`;
-  }
-  return `<span class="badge badge-unknown">Unknown Expiry</span>`;
+
+  // Prefetch badge (updated dynamically by loadStatus)
+  badges += ` <span class="badge badge-prefetch" id="pf-badge-${stream.slug}">Prefetching...</span>`;
+
+  return badges;
 }
 
 function renderStreams() {
@@ -171,6 +179,25 @@ async function loadStatus() {
     $pillUptime.textContent = `Up: ${formatUptime(status.server.uptime)}`;
     $pillMemory.textContent = status.server.memory;
     $pillCache.textContent = `Cache: ${status.cache.hitRate}`;
+
+    // Update prefetch badges on stream cards
+    if (status.prefetch) {
+      for (const [slug, pf] of Object.entries(status.prefetch)) {
+        const badge = document.getElementById(`pf-badge-${slug}`);
+        if (badge) {
+          if (pf.warming) {
+            badge.className = 'badge badge-warning';
+            badge.textContent = 'Warming...';
+          } else if (pf.running) {
+            badge.className = 'badge badge-prefetch';
+            badge.textContent = `${pf.segmentsPrefetched} segs cached`;
+          } else {
+            badge.className = 'badge badge-unknown';
+            badge.textContent = 'Prefetch OFF';
+          }
+        }
+      }
+    }
   } catch {
     // Silently fail for status updates
   }
@@ -352,8 +379,8 @@ document.addEventListener('keydown', (e) => {
   await loadStreams();
   await loadStatus();
 
-  // Refresh status every 30s
-  setInterval(loadStatus, 30000);
+  // Poll status every 5s (prefetch badges need frequent updates)
+  setInterval(loadStatus, 5000);
 
   // Refresh stream list every 60s (to update expiry times)
   setInterval(loadStreams, 60000);

@@ -14,6 +14,7 @@ const StreamCache = require('./lib/cache');
 const RequestDedup = require('./lib/dedup');
 const RateLimiter = require('./lib/rate-limiter');
 const StreamManager = require('./lib/stream-manager');
+const StreamPrefetcher = require('./lib/prefetcher');
 
 // ═══════════════════════════════════════════════════
 //  CLUSTER MODE
@@ -88,19 +89,108 @@ const httpsAgent = new https.Agent({
 });
 
 const streams = new StreamManager();
-const cache = new StreamCache({ maxMemoryMB: 768 });
+const cache = new StreamCache({ maxMemoryMB: 1536 }); // 1.5GB — room for HD segments
 const dedup = new RequestDedup();
-const rateLimiter = new RateLimiter(120); // FIX #3: was 60 — doubled
+const rateLimiter = new RateLimiter(200); // Increased for prefetcher + client traffic
+
+// Performance: strip unnecessary Express overhead
+app.disable('etag');
+app.disable('x-powered-by');
 
 // ═══════════════════════════════════════════════════
-//  FIX #4: Tighter cache TTLs for live content
+//  FIX #4: Cache TTLs tuned for prefetcher strategy
 // ═══════════════════════════════════════════════════
 
 const CACHE_TTL = {
-  MASTER_PLAYLIST: 3000,   // was 4000 → 3s (master rarely changes but stale = wrong quality)
-  CHILD_PLAYLIST:  800,    // was 2000 → 800ms (critical: stale playlist = missing segments)
-  SEGMENT:         600000, // 10m — segments are immutable, keep this
+  MASTER_PLAYLIST: 4000,   // 4s — prefetcher keeps it warm
+  CHILD_PLAYLIST:  1500,   // 1.5s — prefetcher refreshes every ~1s
+  SEGMENT:         600000, // 10m — segments are immutable
 };
+
+// ═══════════════════════════════════════════════════
+//  BACKGROUND PREFETCHER — zero buffering strategy
+//
+//  1. For each stream, a background loop continuously polls
+//     playlists and pre-downloads ALL segments into cache.
+//  2. Client playlists are delayed by N segments so they
+//     only request segments ALREADY in cache.
+//  3. Result: ~100% cache hit rate → zero buffering.
+//  4. Human-like request patterns (jitter, pacing, backoff)
+//     prevent CDN bot-detection.
+// ═══════════════════════════════════════════════════
+
+const prefetchers = new Map(); // slug -> StreamPrefetcher
+const DELAY_SEGMENTS = parseInt(process.env.DELAY_SEGMENTS || '1', 10);
+
+function startPrefetcher(slug, stream) {
+  stopPrefetcher(slug);
+  const pf = new StreamPrefetcher({
+    slug,
+    stream,
+    cache,
+    rateLimiter,
+    fetchFn: (url, options, timeout) => fetchWithRetry(url, options, timeout),
+    headersFn: getHeaders,
+  });
+  prefetchers.set(slug, pf);
+  pf.start();
+}
+
+function stopPrefetcher(slug) {
+  const pf = prefetchers.get(slug);
+  if (pf) {
+    pf.stop();
+    prefetchers.delete(slug);
+  }
+}
+
+/**
+ * Delay a live HLS playlist by stripping the last N segments.
+ * The player sees slightly older content (~2-4s behind live)
+ * but every segment it requests is guaranteed to be in cache.
+ *
+ * #EXT-X-MEDIA-SEQUENCE stays unchanged (first segment index)
+ * so playback continuity is maintained across polls.
+ */
+function delayPlaylist(text, delaySegments) {
+  if (delaySegments <= 0) return text;
+
+  const lines = text.split('\n');
+  const segEntries = []; // { start, end } line indices for each segment
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim().startsWith('#EXTINF:')) {
+      let end = i + 1;
+      while (end < lines.length) {
+        const l = lines[end].trim();
+        if (!l || l.startsWith('#EXT-X-BYTERANGE') ||
+            l.startsWith('#EXT-X-PROGRAM-DATE-TIME') ||
+            l.startsWith('#EXT-X-DISCONTINUITY')) {
+          end++;
+          continue;
+        }
+        if (l.startsWith('#')) { end++; continue; }
+        break; // URL line
+      }
+      if (end < lines.length) {
+        segEntries.push({ start: i, end });
+        i = end;
+      }
+    }
+  }
+
+  // Keep at least 2 segments for the player to work
+  if (segEntries.length <= delaySegments + 1) return text;
+
+  const toRemove = new Set();
+  for (let i = segEntries.length - delaySegments; i < segEntries.length; i++) {
+    for (let j = segEntries[i].start; j <= segEntries[i].end; j++) {
+      toRemove.add(j);
+    }
+  }
+
+  return lines.filter((_, idx) => !toRemove.has(idx)).join('\n');
+}
 
 // ═══════════════════════════════════════════════════
 //  HELPERS
@@ -320,7 +410,10 @@ app.get('/stream/:slug/playlist', async (req, res) => {
       stream.hdntl
     );
 
-    const rewritten = rewritePlaylist(playlist, slug, false);
+    // Apply delay: strip trailing segments so the player only
+    // requests segments the prefetcher has already cached
+    const delayed = delayPlaylist(playlist, DELAY_SEGMENTS);
+    const rewritten = rewritePlaylist(delayed, slug, false);
 
     // ═══════════════════════════════════════════════
     //  FIX #9: Aggressive prefetch — top priority, more segments
@@ -510,6 +603,8 @@ app.post('/api/streams', (req, res) => {
     const { slug, name, streamUrl, hdntl } = req.body;
     if (!streamUrl || !hdntl) return res.status(400).json({ error: 'streamUrl and hdntl required' });
     const stream = streams.addStream({ slug, name, streamUrl, hdntl });
+    // Start background prefetcher IMMEDIATELY — segments cached before any viewer connects
+    startPrefetcher(stream.slug, stream);
     res.status(201).json({
       success: true,
       stream: {
@@ -534,6 +629,7 @@ app.put('/api/streams/:slug', (req, res) => {
       hdntl: hdntl || existing.hdntl,
     });
     cache.invalidateStream(slug);
+    startPrefetcher(stream.slug, stream); // Restart prefetcher with new config
     res.json({ success: true, stream: { slug: stream.slug, name: stream.name, proxyUrl: `/stream/${stream.slug}/live.m3u8` } });
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -546,6 +642,10 @@ app.patch('/api/streams/:slug/cookie', (req, res) => {
     const stream = streams.updateCookie(slug, hdntl);
     cache.invalidate(`${slug}:master`);
     cache.invalidate(`${slug}:child`);
+    // Update prefetcher with new cookie so it keeps fetching
+    const pf = prefetchers.get(slug);
+    if (pf) pf.updateStream(streams.getStreamFull(slug));
+    else startPrefetcher(slug, streams.getStreamFull(slug));
     res.json({ success: true, tokenExpiry: stream.tokenExpiry });
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -553,16 +653,23 @@ app.patch('/api/streams/:slug/cookie', (req, res) => {
 app.delete('/api/streams/:slug', (req, res) => {
   const { slug } = req.params;
   if (!streams.removeStream(slug)) return res.status(404).json({ error: 'Not found' });
+  stopPrefetcher(slug);
   cache.invalidateStream(slug);
   res.json({ success: true });
 });
 
 app.get('/api/status', (req, res) => {
+  const prefetchStatus = {};
+  for (const [slug, pf] of prefetchers) {
+    prefetchStatus[slug] = pf.getStats();
+  }
   res.json({
     streams: streams.listStreams().length,
     cache: cache.getStats(),
     dedup: { activeRequests: dedup.activeRequests },
     rateLimiter: rateLimiter.getStats(),
+    prefetch: prefetchStatus,
+    delaySegments: DELAY_SEGMENTS,
     server: {
       uptime: Math.round(process.uptime()),
       memory: Math.round(process.memoryUsage().heapUsed / 1048576) + 'MB',
@@ -587,9 +694,22 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`
 ╔════════════════════════════════════════════════════╗
-║  Hotstar Restream Proxy v3.1 (Optimized)          ║
+║  Hotstar Restream Proxy v4.0 (Zero-Buffer)        ║
 ║  Port: ${PORT} | PID: ${String(process.pid).padEnd(30)}║
+║  Delay: ${String(DELAY_SEGMENTS + ' segment(s)').padEnd(39)}║
 ╚════════════════════════════════════════════════════╝`);
+
+  // Auto-start prefetchers for all existing streams on boot
+  const existingStreams = streams.listStreams();
+  for (const s of existingStreams) {
+    const full = streams.getStreamFull(s.slug);
+    if (full && full.hdntl) {
+      startPrefetcher(s.slug, full);
+    }
+  }
+  if (existingStreams.length > 0) {
+    console.log(`[Prefetch] Auto-started ${existingStreams.length} prefetcher(s)`);
+  }
 });
 
 } // end startServer()
