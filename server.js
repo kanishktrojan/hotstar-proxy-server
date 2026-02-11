@@ -109,7 +109,7 @@ const CACHE_TTL = {
 // ═══════════════════════════════════════════════════
 
 const prefetchers = new Map(); // slug -> StreamPrefetcher
-const DELAY_SEGMENTS = parseInt(process.env.DELAY_SEGMENTS || '2', 10);
+const DELAY_SEGMENTS = parseInt(process.env.DELAY_SEGMENTS || '5', 10);
 
 function startPrefetcher(slug, stream) {
   stopPrefetcher(slug);
@@ -309,31 +309,44 @@ function sendPlaylist(res, body, fromCache) {
 }
 
 // ═══════════════════════════════════════════════════
-//  FIX #8: Precompile URL rewrite regexes (avoid recompile per request)
+//  FIX #8: Precompile URL rewrite regexes
+//  Match ALL segment types: .ts .m4s .mp4 .aac .m4a .m4v .fmp4
 // ═══════════════════════════════════════════════════
 
-const RE_ABS_TS     = /^(?!#)(https?:\/\/[^\s]+\.ts[^\s]*)$/gm;
-const RE_ABSPATH_TS = /^(?!#)(\/[^\s]+\.ts[^\s]*)$/gm;
-const RE_REL_TS     = /^(?!#)(?!\/)((?!https?:\/\/)[^\s]+\.ts[^\s]*)$/gm;
-const RE_ABS_M3U8     = /^(?!#)(https?:\/\/[^\s]+\.m3u8[^\s]*)$/gm;
-const RE_ABSPATH_M3U8 = /^(?!#)(\/[^\s]+\.m3u8[^\s]*)$/gm;
-const RE_REL_M3U8     = /^(?!#)(?!\/)((?!https?:\/\/)[^\s]+\.m3u8[^\s]*)$/gm;
-const RE_SEG_LINES    = /^(?!#)([^\s]+\.ts[^\s]*)$/gm;
+const SEG_EXT = '(?:ts|m4s|mp4|aac|m4a|m4v|fmp4)';
+
+// Playlist URL patterns (.m3u8) — only used if needed elsewhere
+// (rewritePlaylist now uses line-by-line approach)
+
+// For extracting segment lines from playlist text
+const RE_SEG_LINES = new RegExp(`^(?!#)([^\\s]+\\.${SEG_EXT}[^\\s]*)$`, 'gm');
+
+// Regex to test a single line for segment/playlist extension
+const RE_IS_SEG  = new RegExp(`\\.${SEG_EXT}(\\?|$)`, 'i');
+const RE_IS_M3U8 = /\.m3u8(\?|$)/i;
 
 function rewritePlaylist(playlist, slug, includeM3u8 = false) {
-  let result = playlist
-    .replace(RE_ABS_TS, m => `/stream/${slug}/segment?url=${encodeURIComponent(m)}`)
-    .replace(RE_ABSPATH_TS, m => `/stream/${slug}/segment?path=${encodeURIComponent(m)}`)
-    .replace(RE_REL_TS, `/stream/${slug}/segment?path=$1`);
+  return playlist.split('\n').map(line => {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) return line;
 
-  if (includeM3u8) {
-    result = result
-      .replace(RE_ABS_M3U8, m => `/stream/${slug}/playlist?url=${encodeURIComponent(m)}`)
-      .replace(RE_ABSPATH_M3U8, m => `/stream/${slug}/playlist?path=${encodeURIComponent(m)}`)
-      .replace(RE_REL_M3U8, `/stream/${slug}/playlist?path=$1`);
-  }
+    const isSeg  = RE_IS_SEG.test(t);
+    const isM3u8 = RE_IS_M3U8.test(t);
 
-  return result;
+    if (isSeg) {
+      if (t.startsWith('http'))  return `/stream/${slug}/segment?url=${encodeURIComponent(t)}`;
+      if (t.startsWith('/'))     return `/stream/${slug}/segment?path=${encodeURIComponent(t)}`;
+      return `/stream/${slug}/segment?path=${encodeURIComponent(t)}`;
+    }
+
+    if (isM3u8 && includeM3u8) {
+      if (t.startsWith('http'))  return `/stream/${slug}/playlist?url=${encodeURIComponent(t)}`;
+      if (t.startsWith('/'))     return `/stream/${slug}/playlist?path=${encodeURIComponent(t)}`;
+      return `/stream/${slug}/playlist?path=${encodeURIComponent(t)}`;
+    }
+
+    return line;
+  }).join('\n');
 }
 
 // ═══════════════════════════════════════════════════
@@ -469,6 +482,21 @@ app.get('/stream/:slug/playlist', async (req, res) => {
 //     one CDN request, then all get served from cache
 // ═══════════════════════════════════════════════════
 
+// Determine MIME type from segment filename
+function segmentMime(name) {
+  const ext = (name.match(/\.([a-z0-9]+)$/i) || [])[1];
+  switch (ext && ext.toLowerCase()) {
+    case 'ts':   return 'video/mp2t';
+    case 'm4s':  return 'video/iso.segment';
+    case 'mp4':  return 'video/mp4';
+    case 'm4v':  return 'video/mp4';
+    case 'm4a':  return 'audio/mp4';
+    case 'aac':  return 'audio/aac';
+    case 'fmp4': return 'video/mp4';
+    default:     return 'application/octet-stream';
+  }
+}
+
 app.get('/stream/:slug/segment', async (req, res) => {
   const { slug } = req.params;
   try {
@@ -493,14 +521,16 @@ app.get('/stream/:slug/segment', async (req, res) => {
     }
 
     const cacheKey = `${slug}:seg:${segName}`;
+    const mime = segmentMime(segName);
 
     // 1. CACHE HIT — fast writeHead + end, bypasses Express .send() overhead
     const cached = cache.get(cacheKey);
     if (cached) {
       const data = cached.data;
       const len = Buffer.isBuffer(data) ? data.length : Buffer.byteLength(data);
+      console.log(`[${slug}][SEG] \u2705 HIT \u2192 ${segName} (${(len/1024).toFixed(0)}KB) served from cache`);
       res.writeHead(200, {
-        'Content-Type': 'video/mp2t',
+        'Content-Type': mime,
         'Content-Length': len,
         'Cache-Control': 'max-age=300',
         'X-Cache': 'HIT',
@@ -518,8 +548,9 @@ app.get('/stream/:slug/segment', async (req, res) => {
         if (entry) {
           const d = entry.data;
           const l = Buffer.isBuffer(d) ? d.length : Buffer.byteLength(d);
+          console.log(`[${slug}][SEG] \u267B\uFE0F DEDUP \u2192 ${segName} (${(l/1024).toFixed(0)}KB) served from cache`);
           res.writeHead(200, {
-            'Content-Type': 'video/mp2t',
+            'Content-Type': mime,
             'Content-Length': l,
             'Cache-Control': 'max-age=300',
             'X-Cache': 'DEDUP',
@@ -527,12 +558,12 @@ app.get('/stream/:slug/segment', async (req, res) => {
           return res.end(d);
         }
       } catch (err) {
-        console.warn(`[${slug}][TS] Dedup failed for ${segName}, fetching directly`);
+        console.warn(`[${slug}][SEG] Dedup failed for ${segName}, fetching directly`);
       }
     }
 
     // 3. MISS — fetch from CDN, stream to client, cache for everyone else
-    console.log(`[${slug}][TS] MISS → fetching ${segName} from CDN`);
+    console.log(`[${slug}][SEG] \u274C MISS \u2192 fetching ${segName} from CDN`);
     await rateLimiter.acquire();
 
     const response = await fetchWithRetry(
@@ -549,7 +580,7 @@ app.get('/stream/:slug/segment', async (req, res) => {
     rateLimiter.onCdnSuccess();
 
     const cl = response.headers.get('content-length');
-    res.set('Content-Type', 'video/mp2t');
+    res.set('Content-Type', mime);
     res.set('Cache-Control', 'max-age=300');
     res.set('X-Cache', 'MISS');
     if (cl) res.set('Content-Length', cl);
@@ -565,7 +596,7 @@ app.get('/stream/:slug/segment', async (req, res) => {
         const buffer = Buffer.concat(chunks);
         const headers = { 'content-length': cl || String(buffer.length) };
         cache.set(cacheKey, buffer, headers, CACHE_TTL.SEGMENT);
-        console.log(`[${slug}][TS] Cached ${segName} (${(buffer.length / 1024).toFixed(0)}KB)`);
+        console.log(`[${slug}][SEG] ✅ Cached ${segName} (${(buffer.length / 1024).toFixed(0)}KB) after CDN fetch`);
         if (!res.destroyed) res.end();
         resolve({ buffer, headers });
       });
@@ -580,7 +611,7 @@ app.get('/stream/:slug/segment', async (req, res) => {
     await bufferPromise;
 
   } catch (err) {
-    console.error(`[${slug}][TS] ${err.message}`);
+    console.error(`[${slug}][SEG] ❌ ERROR ${err.message}`);
     if (!res.headersSent) {
       res.status(502).send('Segment error');
     } else if (!res.destroyed) {
