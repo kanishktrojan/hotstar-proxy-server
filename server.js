@@ -92,7 +92,7 @@ app.disable('x-powered-by');
 
 const CACHE_TTL = {
   MASTER_PLAYLIST: 4000,   // 4s — prefetcher keeps it warm
-  CHILD_PLAYLIST:  1500,   // 1.5s — prefetcher refreshes every ~1s
+  CHILD_PLAYLIST:  2500,   // 2.5s — longer TTL avoids excess CDN hits
   SEGMENT:         600000, // 10m — segments are immutable
 };
 
@@ -109,7 +109,7 @@ const CACHE_TTL = {
 // ═══════════════════════════════════════════════════
 
 const prefetchers = new Map(); // slug -> StreamPrefetcher
-const DELAY_SEGMENTS = parseInt(process.env.DELAY_SEGMENTS || '5', 10);
+const DELAY_SEGMENTS = parseInt(process.env.DELAY_SEGMENTS || '2', 10);
 
 function startPrefetcher(slug, stream) {
   stopPrefetcher(slug);
@@ -168,11 +168,13 @@ function delayPlaylist(text, delaySegments) {
     }
   }
 
-  // Keep at least 2 segments for the player to work
-  if (segEntries.length <= delaySegments + 1) return text;
+  // Dynamically cap delay so we ALWAYS keep at least 3 segments for stable playback
+  // e.g. 6 segs with delay=2 → remove 2, keep 4. 4 segs with delay=2 → remove 1, keep 3.
+  const effectiveDelay = Math.min(delaySegments, Math.max(0, segEntries.length - 3));
+  if (effectiveDelay <= 0) return text;
 
   const toRemove = new Set();
-  for (let i = segEntries.length - delaySegments; i < segEntries.length; i++) {
+  for (let i = segEntries.length - effectiveDelay; i < segEntries.length; i++) {
     for (let j = segEntries[i].start; j <= segEntries[i].end; j++) {
       toRemove.add(j);
     }
@@ -328,7 +330,19 @@ const RE_IS_M3U8 = /\.m3u8(\?|$)/i;
 function rewritePlaylist(playlist, slug, includeM3u8 = false) {
   return playlist.split('\n').map(line => {
     const t = line.trim();
-    if (!t || t.startsWith('#')) return line;
+    if (!t) return line;
+
+    // ── Rewrite #EXT-X-MAP:URI (init segments for fMP4/CMAF — CRITICAL) ──
+    // Without this, the player CANNOT decode any .m4s segment → instant stall
+    if (t.startsWith('#EXT-X-MAP:')) {
+      return line.replace(/URI="([^"]+)"/, (_, uri) => {
+        if (uri.startsWith('http')) return `URI="/stream/${slug}/segment?url=${encodeURIComponent(uri)}"`;
+        return `URI="/stream/${slug}/segment?path=${encodeURIComponent(uri)}"`;
+      });
+    }
+
+    // Skip other comment/tag lines
+    if (t.startsWith('#')) return line;
 
     const isSeg  = RE_IS_SEG.test(t);
     const isM3u8 = RE_IS_M3U8.test(t);
@@ -417,51 +431,9 @@ app.get('/stream/:slug/playlist', async (req, res) => {
     const delayed = delayPlaylist(playlist, DELAY_SEGMENTS);
     const rewritten = rewritePlaylist(delayed, slug, false);
 
-    // ═══════════════════════════════════════════════
-    //  FIX #9: Aggressive prefetch — top priority, more segments
-    // ═══════════════════════════════════════════════
-
-    if (!fromCache) { // only prefetch on fresh playlist (new segments appeared)
-      const segMatches = playlist.match(RE_SEG_LINES);
-      if (segMatches && segMatches.length > 0) {
-        // Prefetch the LAST 3 segments (most likely to be requested next)
-        const toWarm = segMatches.slice(-3);
-        for (const seg of toWarm) {
-          let segUrl;
-          if (seg.startsWith('http')) {
-            segUrl = seg;
-          } else if (seg.startsWith('/')) {
-            const base = new URL(stream.streamBase);
-            segUrl = `${base.protocol}//${base.host}${seg}`;
-          } else {
-            segUrl = `${stream.streamBase}/${seg}`;
-          }
-          const segName = seg.split('/').pop().split('?')[0];
-          const segKey = `${slug}:seg:${segName}`;
-
-          if (!cache.has(segKey) && !dedup.inflight.has(segKey)) {
-            // FIX: Use 'high' priority for prefetch — these WILL be requested
-            dedup.dedupFetch(segKey, async () => {
-              try {
-                await rateLimiter.acquire('high'); // was 'low' — upgraded
-                const resp = await fetchWithTimeout(
-                  segUrl,
-                  { headers: getHeaders(stream.hdntl) },
-                  8000 // was 10000
-                );
-                if (resp.ok) {
-                  const buf = await resp.buffer();
-                  cache.set(segKey, buf, {
-                    'content-length': resp.headers.get('content-length')
-                  }, CACHE_TTL.SEGMENT);
-                  rateLimiter.onCdnSuccess();
-                }
-              } catch (_) {}
-            }).catch(() => {});
-          }
-        }
-      }
-    }
+    // Background prefetcher handles all segment pre-caching.
+    // No inline prefetch — it was competing for rate-limiter tokens
+    // and causing client segment requests to queue behind it.
 
     sendPlaylist(res, rewritten, fromCache);
 
@@ -564,7 +536,7 @@ app.get('/stream/:slug/segment', async (req, res) => {
 
     // 3. MISS — fetch from CDN, stream to client, cache for everyone else
     console.log(`[${slug}][SEG] \u274C MISS \u2192 fetching ${segName} from CDN`);
-    await rateLimiter.acquire();
+    await rateLimiter.acquire('high'); // high priority — real viewer is waiting!
 
     const response = await fetchWithRetry(
       url,
