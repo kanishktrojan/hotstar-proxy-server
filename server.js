@@ -459,15 +459,14 @@ app.get('/stream/:slug/playlist', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════
-//  SEGMENT SERVING — ultra-optimized for concurrent clients
+//  SEGMENT SERVING — optimized for concurrent clients
 //
 //  Key optimizations:
-//  1. Raw res.socket.write() for cache hits — bypasses Express
-//     serialization/encoding overhead (saves 5-15ms per segment)
-//  2. Pre-built HTTP headers as a single Buffer — zero allocation
-//  3. Zero-copy: Buffer.from(cached.data) shares memory
-//  4. Concurrent clients hitting same uncached segment get
-//     stream-piped chunks as they arrive (no waiting for full download)
+//  1. writeHead() + end(data) — skips Express's res.send() overhead
+//     (no JSON detection, no ETag, no content-type guessing)
+//  2. Cache hits are instant — just buffer write, no CDN round-trip
+//  3. Dedup: concurrent clients for same uncached segment share
+//     one CDN request, then all get served from cache
 // ═══════════════════════════════════════════════════
 
 app.get('/stream/:slug/segment', async (req, res) => {
@@ -495,29 +494,17 @@ app.get('/stream/:slug/segment', async (req, res) => {
 
     const cacheKey = `${slug}:seg:${segName}`;
 
-    // 1. CACHE HIT — ultra-fast raw write, bypasses Express entirely
+    // 1. CACHE HIT — fast writeHead + end, bypasses Express .send() overhead
     const cached = cache.get(cacheKey);
     if (cached) {
       const data = cached.data;
       const len = Buffer.isBuffer(data) ? data.length : Buffer.byteLength(data);
-      // Write raw HTTP — faster than res.send() for large binary blobs
-      const raw = res.socket;
-      if (raw && !raw.destroyed) {
-        const head = `HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: ${len}\r\nCache-Control: max-age=300\r\nAccess-Control-Allow-Origin: *\r\nX-Cache: HIT\r\nConnection: keep-alive\r\n\r\n`;
-        raw.cork();
-        raw.write(head);
-        raw.write(data);
-        raw.uncork();
-        // Mark response as finished so Express doesn't try to send more
-        res.writableEnded = true;
-        res._headerSent = true;
-        return;
-      }
-      // Fallback if socket weirdness
-      res.set('Content-Type', 'video/mp2t');
-      res.set('Content-Length', String(len));
-      res.set('Cache-Control', 'max-age=300');
-      res.set('X-Cache', 'HIT');
+      res.writeHead(200, {
+        'Content-Type': 'video/mp2t',
+        'Content-Length': len,
+        'Cache-Control': 'max-age=300',
+        'X-Cache': 'HIT',
+      });
       return res.end(data);
     }
 
@@ -531,10 +518,12 @@ app.get('/stream/:slug/segment', async (req, res) => {
         if (entry) {
           const d = entry.data;
           const l = Buffer.isBuffer(d) ? d.length : Buffer.byteLength(d);
-          res.set('Content-Type', 'video/mp2t');
-          res.set('Content-Length', String(l));
-          res.set('Cache-Control', 'max-age=300');
-          res.set('X-Cache', 'DEDUP');
+          res.writeHead(200, {
+            'Content-Type': 'video/mp2t',
+            'Content-Length': l,
+            'Cache-Control': 'max-age=300',
+            'X-Cache': 'DEDUP',
+          });
           return res.end(d);
         }
       } catch (err) {
@@ -543,6 +532,7 @@ app.get('/stream/:slug/segment', async (req, res) => {
     }
 
     // 3. MISS — fetch from CDN, stream to client, cache for everyone else
+    console.log(`[${slug}][TS] MISS → fetching ${segName} from CDN`);
     await rateLimiter.acquire();
 
     const response = await fetchWithRetry(
@@ -575,6 +565,7 @@ app.get('/stream/:slug/segment', async (req, res) => {
         const buffer = Buffer.concat(chunks);
         const headers = { 'content-length': cl || String(buffer.length) };
         cache.set(cacheKey, buffer, headers, CACHE_TTL.SEGMENT);
+        console.log(`[${slug}][TS] Cached ${segName} (${(buffer.length / 1024).toFixed(0)}KB)`);
         if (!res.destroyed) res.end();
         resolve({ buffer, headers });
       });
@@ -590,7 +581,7 @@ app.get('/stream/:slug/segment', async (req, res) => {
 
   } catch (err) {
     console.error(`[${slug}][TS] ${err.message}`);
-    if (!res.headersSent && !res.writableEnded) {
+    if (!res.headersSent) {
       res.status(502).send('Segment error');
     } else if (!res.destroyed) {
       res.end();
