@@ -52,7 +52,7 @@ function getAgent(url) { return url.startsWith('https') ? httpsAgent : httpAgent
 const streams     = new StreamManager();
 const cache       = new StreamCache({ maxMemoryMB: 1536 });
 const dedup       = new RequestDedup();
-const rateLimiter = new RateLimiter(200);
+const rateLimiter = new RateLimiter(40); // Conservative — avoid 429
 
 const CACHE_TTL = {
   MASTER_PLAYLIST: 4000,    // 4 s
