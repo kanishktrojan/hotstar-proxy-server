@@ -185,12 +185,9 @@ async function loadStatus() {
       for (const [slug, pf] of Object.entries(status.prefetch)) {
         const badge = document.getElementById(`pf-badge-${slug}`);
         if (badge) {
-          if (pf.warming) {
-            badge.className = 'badge badge-warning';
-            badge.textContent = 'Warming...';
-          } else if (pf.running) {
+          if (pf.running) {
             badge.className = 'badge badge-prefetch';
-            badge.textContent = `${pf.segmentsPrefetched} segs cached`;
+            badge.textContent = `${pf.prefetched} segs cached`;
           } else {
             badge.className = 'badge badge-unknown';
             badge.textContent = 'Prefetch OFF';
